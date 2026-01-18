@@ -19,7 +19,14 @@ pub struct MarketOrchestrator {
 }
 
 impl MarketOrchestrator {
-    pub fn new(fetchers: Vec<Box<dyn PoolFetcher>>) -> Self {
+    pub fn new(rpc_url: String) -> Self {
+        let mut fetchers: Vec<Box<dyn PoolFetcher>> = Vec::new();
+        
+        // Initialize all on-chain fetchers
+        fetchers.push(Box::new(raydium::RaydiumOnchainFetcher::new(rpc_url.clone())));
+        fetchers.push(Box::new(meteora::MeteoraOnchainFetcher::new(rpc_url.clone())));
+        fetchers.push(Box::new(orca::OrcaOnchainFetcher::new(rpc_url)));
+        
         Self { fetchers }
     }
     

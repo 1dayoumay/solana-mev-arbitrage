@@ -1,63 +1,63 @@
+use crate::dex;
 use super::PoolFetcher;
 use crate::error::{BotError, Result};
 use crate::types::{PoolInfo, TokenMint, DexType};
-use crate::config::DexConfig;
 use async_trait::async_trait;
 use solana_sdk::pubkey::Pubkey;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcProgramAccountsConfig, RpcAccountInfoConfig};
 use solana_sdk::commitment_config::CommitmentConfig;
-use orca_whirlpools_client::Whirlpool;
+use std::sync::Arc;
 use spl_token::state::Mint;
-use solana_sdk::program_pack::Pack; // ✅ ADD THIS LINE
+use solana_sdk::program_pack::Pack;
 
 pub struct OrcaOnchainFetcher {
-    config: DexConfig,
-    rpc_url: String,
+    rpc_client: Arc<RpcClient>,
 }
 
 impl OrcaOnchainFetcher {
-    pub fn new(config: DexConfig, rpc_url: String) -> Self {
-        Self { config, rpc_url }
+    pub fn new(rpc_url: String) -> Self {
+        Self {
+            rpc_client: Arc::new(RpcClient::new(rpc_url)),
+        }
     }
     
-    fn parse_whirlpool(&self, address: &Pubkey, whirlpool: &Whirlpool, rpc_client: &RpcClient) -> Result<PoolInfo> {
-        let token_a_mint = whirlpool.token_mint_a;
-        let token_b_mint = whirlpool.token_mint_b;
-        
-        if token_a_mint == Pubkey::default() || token_b_mint == Pubkey::default() {
-            return Err(BotError::InvalidPoolData("Zero mint address".to_string()));
+    fn parse_whirlpool(&self, address: &Pubkey, data: &[u8]) -> Result<Option<PoolInfo>> {
+        if let Ok(whirlpool) = dex::whirlpool::state::Whirlpool::try_deserialize(data) {
+            let sqrt_price = whirlpool.sqrt_price as f64 / (1u128 << 64) as f64;
+            let price = sqrt_price * sqrt_price;
+            
+            // Fetch mint decimals
+            let token_a_account = self.rpc_client.get_account(&whirlpool.token_mint_a)
+                .map_err(|e| BotError::RateLimitError(format!("Failed to fetch token A mint: {}", e)))?;
+            let token_b_account = self.rpc_client.get_account(&whirlpool.token_mint_b)
+                .map_err(|e| BotError::RateLimitError(format!("Failed to fetch token B mint: {}", e)))?;
+            
+            let token_a_mint_data = Mint::unpack(&token_a_account.data)
+                .map_err(|e| BotError::InvalidPoolData(format!("Failed to unpack token A mint: {}", e)))?;
+            let token_b_mint_data = Mint::unpack(&token_b_account.data)
+                .map_err(|e| BotError::InvalidPoolData(format!("Failed to unpack token B mint: {}", e)))?;
+            
+            // Calculate liquidity in USD (simplified)
+            let liquidity_a = whirlpool.liquidity as f64 / (10u64.pow(token_a_mint_data.decimals as u32) as f64);
+            let liquidity_b = whirlpool.liquidity as f64 / (10u64.pow(token_b_mint_data.decimals as u32) as f64);
+            let liquidity_usd = liquidity_a * price + liquidity_b;
+            
+            let fee_bps = whirlpool.fee_rate / 100;
+            
+            Ok(Some(PoolInfo {
+                address: *address,
+                dex: DexType::Orca,
+                token_a: TokenMint(whirlpool.token_mint_a),
+                token_b: TokenMint(whirlpool.token_mint_b),
+                price,
+                liquidity_usd,
+                fee_bps,
+                last_updated: std::time::Instant::now(),
+            }))
+        } else {
+            Ok(None)
         }
-        
-        let sqrt_price = whirlpool.sqrt_price as f64 / (1u128 << 64) as f64;
-        let price = sqrt_price * sqrt_price;
-        
-        let token_a_account = rpc_client.get_account(&token_a_mint)
-            .map_err(|e| BotError::RateLimitError(format!("Failed to fetch token A mint: {}", e)))?;
-        let token_b_account = rpc_client.get_account(&token_b_mint)
-            .map_err(|e| BotError::RateLimitError(format!("Failed to fetch token B mint: {}", e)))?;
-        
-        let token_a_mint_data = Mint::unpack(&token_a_account.data)
-            .map_err(|e| BotError::InvalidPoolData(format!("Failed to unpack token A mint: {}", e)))?;
-        let token_b_mint_data = Mint::unpack(&token_b_account.data)
-            .map_err(|e| BotError::InvalidPoolData(format!("Failed to unpack token B mint: {}", e)))?;
-        
-        let liquidity_a = whirlpool.liquidity as f64 / (10u64.pow(token_a_mint_data.decimals as u32) as f64);
-        let liquidity_b = whirlpool.liquidity as f64 / (10u64.pow(token_b_mint_data.decimals as u32) as f64);
-        let liquidity_usd = liquidity_a * price + liquidity_b;
-        
-        let fee_bps = whirlpool.fee_rate / 100;
-        
-        Ok(PoolInfo {
-            address: *address,
-            dex: DexType::Orca,
-            token_a: TokenMint(token_a_mint),
-            token_b: TokenMint(token_b_mint),
-            price,
-            liquidity_usd,
-            fee_bps,
-            last_updated: std::time::Instant::now(),
-        })
     }
 }
 
@@ -70,7 +70,6 @@ impl PoolFetcher for OrcaOnchainFetcher {
     async fn fetch_pools(&self) -> Result<Vec<PoolInfo>> {
         tracing::info!("Fetching Orca Whirlpools on-chain...");
         
-        let rpc_client = RpcClient::new(self.rpc_url.clone());
         let config = RpcProgramAccountsConfig {
             account_config: RpcAccountInfoConfig {
                 encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
@@ -80,22 +79,17 @@ impl PoolFetcher for OrcaOnchainFetcher {
             ..Default::default()
         };
         
-        let accounts = rpc_client.get_program_accounts_with_config(&self.config.program_id, config)
+        let program_id = dex::whirlpool::constants::whirlpool_program_id();
+        let accounts = self.rpc_client.get_program_accounts_with_config(&program_id, config)
             .map_err(|e| BotError::RateLimitError(format!("RPC error: {}", e)))?;
         
         let mut pools = Vec::new();
         
         for (pubkey, account) in accounts {
-            match Whirlpool::from_bytes(&account.data) {
-                Ok(whirlpool) => {
-                    match self.parse_whirlpool(&pubkey, &whirlpool, &rpc_client) {
-                        Ok(pool) => pools.push(pool),
-                        Err(e) => tracing::debug!("Failed to parse pool {}: {}", pubkey, e),
-                    }
-                }
-                Err(_) => {
-                    continue;
-                }
+            match self.parse_whirlpool(&pubkey, &account.data) {
+                Ok(Some(pool)) => pools.push(pool),
+                Ok(None) => continue,
+                Err(e) => tracing::debug!("Failed to parse pool {}: {}", pubkey, e),
             }
         }
         
@@ -104,15 +98,8 @@ impl PoolFetcher for OrcaOnchainFetcher {
     }
     
     async fn fetch_pool_by_address(&self, address: &Pubkey) -> Result<Option<PoolInfo>> {
-        let rpc_client = RpcClient::new(self.rpc_url.clone());
-        
-        match rpc_client.get_account(address) {
-            Ok(account) => {
-                match Whirlpool::from_bytes(&account.data) {
-                    Ok(whirlpool) => self.parse_whirlpool(address, &whirlpool, &rpc_client).map(Some),
-                    Err(_) => Ok(None),
-                }
-            }
+        match self.rpc_client.get_account(address) {
+            Ok(account) => self.parse_whirlpool(address, &account.data),
             Err(_) => Ok(None),
         }
     }

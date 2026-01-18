@@ -4,13 +4,11 @@ mod types;
 mod market;
 mod graph;
 mod utils;
+mod dex; // Add this line to include your dex module
 
 use crate::config::AppConfig;
 use crate::graph::{GraphEngine, PetgraphEngine};
-use crate::market::{MarketOrchestrator, PoolFetcher};
-use crate::market::raydium::RaydiumApiFetcher;
-use crate::market::meteora::MeteoraApiFetcher;
-use crate::market::orca::OrcaOnchainFetcher;
+use crate::market::MarketOrchestrator;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::time::{interval, Duration};
@@ -18,13 +16,12 @@ use tracing::{info, error};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing - FIXED: .json() not .with_json()
     tracing_subscriber::fmt()
         .json()
         .with_level(true)
         .init();
     
-    info!("Starting MEV Bot Phase 1 - Hybrid Pool Indexer");
+    info!("Starting MEV Bot Phase 1 - Pure On-Chain Pool Indexer");
     
     // Load configuration
     let app_config = AppConfig::from_env()?;
@@ -32,33 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize graph engine
     let mut graph_engine = PetgraphEngine::new();
     
-    // Initialize DEX fetchers
-    let mut fetchers: Vec<Box<dyn PoolFetcher>> = Vec::new();
-    
-    for dex_config in &app_config.dex_configs {
-        match dex_config.name {
-            "Raydium" => {
-                fetchers.push(Box::new(RaydiumApiFetcher::new(dex_config.clone())));
-                info!("Initialized Raydium API fetcher");
-            }
-            "Meteora" => {
-                fetchers.push(Box::new(MeteoraApiFetcher::new(dex_config.clone())));
-                info!("Initialized Meteora API fetcher");
-            }
-            "Orca" => {
-                fetchers.push(Box::new(OrcaOnchainFetcher::new(
-                    dex_config.clone(),
-                    app_config.rpc_url.clone()
-                )));
-                info!("Initialized Orca on-chain fetcher");
-            }
-            _ => {
-                error!("Unknown DEX: {}", dex_config.name);
-            }
-        }
-    }
-    
-    let orchestrator = MarketOrchestrator::new(fetchers);
+    // Initialize market orchestrator with on-chain fetchers
+    let orchestrator = MarketOrchestrator::new(app_config.rpc_url.clone());
     
     // Graceful shutdown handling
     let shutdown_token = Arc::new(tokio::sync::Notify::new());
