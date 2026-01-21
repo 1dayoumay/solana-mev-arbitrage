@@ -23,25 +23,17 @@ pub struct RaydiumCpAmmInfo {
 }
 
 impl RaydiumCpAmmInfo {
-    fn slice_to_pubkey(data: &[u8], start: usize, end: usize) -> Pubkey {
-        Pubkey::new_from_array(
-            data[start..end]
-                .try_into()
-                .expect(&format!("Failed to convert slice [{}..{}] to 32-byte array", start, end))
-        )
-    }
-
     pub fn load_checked(data: &[u8]) -> Result<Self> {
         if data.len() < OBSERVATION_KEY_OFFSET + 32 {
             return Err(anyhow::anyhow!("Invalid data length for RaydiumCpAmmInfo"));
         }
         
-        let token_0_vault = Self::slice_to_pubkey(&data, TOKEN_0_VAULT_OFFSET, TOKEN_0_VAULT_OFFSET + 32);
-        let token_1_vault = Self::slice_to_pubkey(&data, TOKEN_1_VAULT_OFFSET, TOKEN_1_VAULT_OFFSET + 32);
-        let token_0_mint = Self::slice_to_pubkey(&data, TOKEN_0_MINT_OFFSET, TOKEN_0_MINT_OFFSET + 32);
-        let token_1_mint = Self::slice_to_pubkey(&data, TOKEN_1_MINT_OFFSET, TOKEN_1_MINT_OFFSET + 32);
-        let amm_config = Self::slice_to_pubkey(&data, AMM_CONFIG_OFFSET, AMM_CONFIG_OFFSET + 32);
-        let observation_key = Self::slice_to_pubkey(&data, OBSERVATION_KEY_OFFSET, OBSERVATION_KEY_OFFSET + 32);
+        let token_0_vault = Pubkey::new(&data[TOKEN_0_VAULT_OFFSET..TOKEN_0_VAULT_OFFSET + 32]);
+        let token_1_vault = Pubkey::new(&data[TOKEN_1_VAULT_OFFSET..TOKEN_1_VAULT_OFFSET + 32]);
+        let token_0_mint = Pubkey::new(&data[TOKEN_0_MINT_OFFSET..TOKEN_0_MINT_OFFSET + 32]);
+        let token_1_mint = Pubkey::new(&data[TOKEN_1_MINT_OFFSET..TOKEN_1_MINT_OFFSET + 32]);
+        let amm_config = Pubkey::new(&data[AMM_CONFIG_OFFSET..AMM_CONFIG_OFFSET + 32]);
+        let observation_key = Pubkey::new(&data[OBSERVATION_KEY_OFFSET..OBSERVATION_KEY_OFFSET + 32]);
         
         Ok(Self {
             token_0_mint,

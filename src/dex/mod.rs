@@ -1,6 +1,10 @@
+pub mod byreal;
+pub mod futarchy;
+pub mod heaven;
+pub mod humidifi;
 pub mod meteora;
+pub mod pancakeswap;
 pub mod pump;
 pub mod raydium;
-pub mod solfi;
 pub mod vertigo;
 pub mod whirlpool;

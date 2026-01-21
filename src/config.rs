@@ -1,38 +1,78 @@
-use std::str::FromStr;
+use serde::{Deserialize, Deserializer};
+use std::{env, fs::File, io::Read};
 
-#[derive(Clone, Debug)]
-pub struct AppConfig {
-    pub rpc_url: String,
-    pub rpc_ws_url: String,
-    pub min_liquidity_usd: f64,
-    pub update_interval_secs: u64,
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub bot: BotConfig,
+    pub routing: RoutingConfig,
+    pub rpc: RpcConfig,
+    pub spam: Option<SpamConfig>,
+    pub wallet: WalletConfig,
+    pub flashloan: Option<FlashloanConfig>,
 }
 
-impl AppConfig {
-    pub fn from_env() -> Result<Self, crate::error::BotError> {
-        dotenvy::dotenv().ok();
-        
-        let rpc_url = std::env::var("RPC_URL")
-            .map_err(|_| crate::error::BotError::ConfigError("RPC_URL not set".to_string()))?;
-            
-        let rpc_ws_url = std::env::var("RPC_WS_URL")
-            .map_err(|_| crate::error::BotError::ConfigError("RPC_WS_URL not set".to_string()))?;
-        
-        let min_liquidity_usd = std::env::var("MIN_LIQUIDITY_USD")
-            .unwrap_or_else(|_| "50000".to_string())
-            .parse()
-            .map_err(|e| crate::error::BotError::ConfigError(format!("Invalid MIN_LIQUIDITY_USD: {}", e)))?;
-            
-        let update_interval_secs = std::env::var("UPDATE_INTERVAL_SECS")
-            .unwrap_or_else(|_| "15".to_string())
-            .parse()
-            .map_err(|e| crate::error::BotError::ConfigError(format!("Invalid UPDATE_INTERVAL_SECS: {}", e)))?;
-        
-        Ok(Self {
-            rpc_url,
-            rpc_ws_url,
-            min_liquidity_usd,
-            update_interval_secs,
-        })
+#[derive(Debug, Deserialize, Clone)]
+pub struct BotConfig {
+    pub compute_unit_limit: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoutingConfig {
+    pub markets: MarketsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MarketsConfig {
+    pub markets: Vec<String>,
+    pub lookup_table_accounts: Option<Vec<String>>,
+    pub process_delay: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RpcConfig {
+    #[serde(deserialize_with = "serde_string_or_env")]
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SpamConfig {
+    pub enabled: bool,
+    pub sending_rpc_urls: Vec<String>,
+    pub compute_unit_price: u64,
+    pub max_retries: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletConfig {
+    #[serde(deserialize_with = "serde_string_or_env")]
+    pub private_key: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FlashloanConfig {
+    pub enabled: bool,
+}
+
+pub fn serde_string_or_env<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value_or_env = String::deserialize(deserializer)?;
+    let value = match value_or_env.chars().next() {
+        Some('$') => env::var(&value_or_env[1..])
+            .unwrap_or_else(|_| panic!("reading `{}` from env", &value_or_env[1..])),
+        _ => value_or_env,
+    };
+    Ok(value)
+}
+
+impl Config {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        let config: Config = toml::from_str(&contents)?;
+        Ok(config)
     }
 }
