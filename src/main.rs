@@ -1,13 +1,4 @@
-mod ata;
-mod bot;
-mod config;
-mod constants;
-mod dex;
-mod pool_refreshers;
-mod pools;
-mod refresh;
-mod transaction;
-
+use solana_onchain_arbitrage_bot::bot::run_bot;
 use clap::{App, Arg};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -40,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let config_path = matches.value_of("config").unwrap();
     info!("Using config file: {}", config_path);
 
-    bot::run_bot(config_path).await?;
+    run_bot(config_path).await?;
 
     Ok(())
 }

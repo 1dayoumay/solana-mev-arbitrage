@@ -11,6 +11,10 @@ name = "solana_onchain_arbitrage_bot"
 path = "src/lib.rs"
 
 [dependencies]
+dashmap = "5.5"
+rayon = "1.8"
+ordered-float = "4.2"  # For f64 in DashMap
+
 # Core Solana dependencies
 solana-sdk = "1.17"
 solana-client = "1.17"

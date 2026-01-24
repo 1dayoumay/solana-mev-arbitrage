@@ -1,81 +1,154 @@
-Excellent vision for a production-grade MEV arbitrage system. Based on the architecture we've already established (structured configs, error handling, token discovery, simulation framework), here's my assessment and a refined roadmap:
+# Cross-Dex Arbitrage System: Progressive Complexity Roadmap
 
-## Technical Feasibility Assessment
+## Architecture Foundation (Current State)
 
-**What We Have**: Strong foundation with dynamic token discovery, DEX-specific transaction builders, simulation engine, and robust error handling.
+**Present**: Pool discovery via `initialize_pools_from_markets()`, real-time state refresh (`PoolDataRefresher`), multi-base token support, account derivation cache.
 
-**Critical Challenge**: Atomic execution of 3+ hop cycles. Without a custom on-chain executor program, multi-hop arbitrage must be split into multiple transactions, creating race conditions and MEV exposure. Triangular+ detection works; execution is the constraint.
+**Missing**: Price calculation engine, graph structure, cycle detection, simulation layer, instruction builders, Jito integration.
 
-## Refined 5-Phase Architecture
+---
 
-### **Phase 1: Real-Time Graph Construction**
-*Duration: 1-2 weeks*
-- **Pool Indexer**: Continuously fetch from Raydium/Orca/Meteora with `getProgramAccounts` and subscription websockets
-- **Graph Engine**: Build directed graph where nodes = tokens, edges = (pool_address, DEX, price, liquidity_depth, fee_tier)
-- **Liquidity Filter**: Only include pools with >$50k TVL and 100+ SOL depth to ensure executability
-- **Update Strategy**: 15-second refresh cycles with incremental updates (don't rebuild from scratch)
+## Phase 1: Off-Chain Logic & Simulation Engine (Zero Transaction Cost)
 
-### **Phase 2: Cycle Detection & Filtering**
-*Duration: 2-3 weeks*
-- **Algorithm**: Tarjan's strongly connected components for cycle detection (O(V+E) complexity)
-- **Path Filtering**: Explicitly exclude 2-hop cycles. Your examples are perfect:
-  - Triangular: SOL→USDC→USDT→SOL
-  - 3-hop single DEX: SOL→RAY→USDC→SOL
-  - 4-hop cross-DEX: SOL→RAY→USDC→USDT→SOL
-- **Profitability Pre-Filter**: Quick math check before simulation: `(1-fee)^n > 1.005` (0.5% min profit)
-- **Concurrency**: Process 100+ cycles in parallel using `rayon` crate
+### 1.1 Real-Time Graph Construction
+**Methodology**: 
+- **Nodes**: Token mints (SOL, USDC, TOKEN_A).
+- **Edges**: Bidirectional per pool. Store `price`, `liquidity_depth`, `fee_tier`, `DexType`, and **SDK pool struct pointer**.
+- **Price Sources**: 
+  - CLMM: `price = sqrt_price_x64² / 2^128`
+  - AMM: `price = reserve_out / reserve_in`
+  - and so on...
 
-### **Phase 3: Deep Simulation & Optimization**
-*Duration: 2-3 weeks*
-- **Jupiter Integration**: Use for route validation and price quotes (not execution)
-- **LUT Generation**: Dynamically build Address Lookup Tables for each unique cycle to reduce TX size by 60%
-- **On-Chain Simulation**: `simulateTransaction` RPC calls with full state commitment
-- **Slippage Modeling**: Dynamic slippage based on pool depth: `slippage = 0.1% + (trade_size / pool_liquidity)`
-- **Hot Path**: <200ms from detection to simulate result
+### 1.2 Negative Cycle Detection
+**Algorithm**: Tarjan's SCC. Filter cycles by `min_hops` and `max_hops` (configurable, default 2-5). Exclude 2-hop unless explicitly enabled.
+**Pre-Filter**: `Π(price_i) > 1.005` (0.5% profit after fees) before simulation.
 
-### **Phase 4: Production Transaction Building & MEV Protection**
-*Duration: 3-4 weeks (most complex)*
-- **DEX Builders**: 
-  - Raydium: `swapBaseIn`/`swapBaseOut` with exact instruction encoding
-  - Orca: Whirlpool swap using `SwapV2` instruction
-  - Meteora: DLMM swap with bin integration
-- **Jito Bundles**: 
-  - Bundle 3-4 arbitrage transactions together
-  - Add tip payment (0.01-0.05 SOL) based on profit potential
-  - Use `bundle.SendBundle` with 300ms timeout
-- **Execution Strategy**: 
-  - Without executor program: Execute hops sequentially with callbacks
-  - **Recommended**: Deploy minimal executor program for atomic swaps (~200 lines Anchor code)
-  - Flash loan integration via Solend/Port for capital efficiency
+### 1.3 Amount Optimization & Slippage Modeling
+**Binary Search**: Find `max_amount_in` where profit > 0, bounded by `min(capital, liquidity/10)`.
+**Slippage**: `slippage_bp = 10 + (trade_size / pool_liquidity) * 10000`. Applied per leg to `minimum_out`.
 
-### **Phase 5: Real-Time Analytics & Monitoring**
-*Duration: 1-2 weeks*
-- **Structured Logging**: JSON logs with trace IDs: `arbitrage_id`, `cycle_path`, `expected_profit`, `actual_profit`, `latency_ms`
-- **Metrics Dashboard**: 
-  - Win rate per cycle type
-  - Slippage vs expected
-  - Jito bundle landing rate
-  - RPC latency percentiles
-- **Circuit Breakers**: Auto-pause if 5 failures in 10 minutes or RPC latency >1s
-- **Profit Tracker**: Real-time P&L with SOL cost basis accounting
+### 1.4 Simulation Engine (Local)
+**SDK Integration**: Call `sol-trade-sdk`'s `simulate` flag in `TradeBuyParams`. Parse logs for exact output amounts and CU consumption.
+**Validation**: 
+- Verify `simulated_profit > jito_tip + priority_fee + 0.01 SOL` buffer.
+- Check `simulation_result.value.err.is_none()`.
+- Measure `latency_ms` from detection to simulate finish.
 
-## Key Technical Considerations
+---
 
-1. **RPC Infrastructure**: Use GenesysGo/QuickNode premium with backup RPCs. Budget $500-800/month.
-2. **Rate Limits**: Implement 10-request-per-second limiter per DEX to avoid IP bans
-3. **Capital Requirements**: $5k-10k SOL minimum for profitable multi-hop (gas costs add up)
-4. **JITO Tips**: Dynamic tipping: `tip = min(profit * 0.15, 0.05 SOL)` for bundle inclusion
-5. **Error Handling**: 
-   - Retry: 3 attempts with exponential backoff
-   - Graceful degradation: Fall back to 2-hop if 3+ fails consistently
-   - RPC failover: Automatic switch to backup endpoints
+## Phase 2: Transaction Building & Validation (Local Execution)
 
-## Immediate Next Steps
+### 2.1 SDK Instruction Composition
+**Mapping**: Convert `SwapLeg` to SDK `TradeBuyParams`:
+- `DexType` → SDK enum variant.
+- `MintPoolData` → SDK `*Params` struct (e.g., `PumpFunParams` from `PumpPool`).
+- Set `create_input_mint_ata: true`, `close_input_mint_ata: true` for WSOL legs.
 
-1. **Week 1**: Finalize pool indexing service with Graph data structure
-2. **Week 2**: Implement Tarjan's algorithm with 2-hop filter
-3. **Week 3**: Integrate Jupiter API for price validation
-4. **Week 4**: Build DEX-specific instruction builders (start with Raydium)
-5. **Week 5**: Jito bundle integration + test on devnet
+### 2.2 Multi-Leg Transaction Assembly
+**Pattern**: 
+```rust
+let mut instructions = vec![compute_budget_ix];
+for leg in route.legs {
+    let mut leg_ixs = sdk_builder.build_buy_instructions(&params).await?;
+    instructions.append(&mut leg_ixs);
+}
+```
+**Size Check**: If `instructions.len() > 20`, generate ALT via SDK's `address_lookup` module.
 
-**Bottom Line**: This architecture is highly achievable. The 3+ hop filtering is straightforward in the cycle detection phase. The main hurdle is atomic execution—I'd prioritize building/deploying a minimal executor program in Phase 4 to unlock the full potential. Without it, you're limited to single-hop or risky multi-tx arbitrage.
+### 2.3 Local Validation
+**Dry Run**: Execute `rpc.simulate_transaction()` on fully assembled transaction (without sending).
+**Assert**:
+- `simulation_value.err.is_none()`
+- `simulation_value.logs.contains("Profit: X SOL")`
+- Transaction size < 1232 bytes (or ALT populated correctly).
+
+---
+
+## Phase 3: On-Chain Execution via Jito Bundles
+
+### 3.1 Jito Integration
+**Bundle Construction**: 
+- Add tip instruction: `ComputeBudgetInstruction::transfer(min(simulated_profit * 0.15, 0.05 SOL))` to Jito tip account.
+- Use `VersionedTransaction` with ALT. **Single bundle per cycle** (atomic execution).
+- **Timeout**: 300ms. Retry 3x with 20% tip increase each attempt.
+
+### 3.2 Execution Modes (Configurable)
+- **Sequential**: For 2-hop cycles, single transaction. No executor program needed.
+- **Bundled**: For 3+ hop cycles, Jito bundle with all legs. **No executor program**—relies on bundle atomicity.
+- **Executor Program** (Optional): Deploy Anchor CPI program for true atomic multi-hop if bundle reliability is insufficient.
+
+### 3.3 Landing Verification
+**Callback**: Parse `bundle_result` for transaction signatures.
+**Metrics**: Track `bundle_landing_rate` and `actual_profit` vs `simulated_profit`.
+
+---
+
+## Phase 4: Capital Efficiency & Advanced Features
+
+### 4.1 Flash Loan Integration (Toggleable)
+**Trigger Condition**: Enable when `trade_size > 6000 * flash_loan_fee` (e.g., 0.09% Kamino fee → trades >$6k).
+**Flow**: 
+1. Flash loan borrow → 2. Execute cycle → 3. Repay loan + fee → 4. Profit remains.
+**Implementation**: Wrap SDK builders in loan/repay instructions via `solend_sdk`.
+
+### 4.2 Multi-Threaded Detection
+**Parallelization**: Use `rayon` crate for graph traversal. Shard graph by token mint prefix (e.g., 16 shards on `mint[0] & 0xF`).
+
+### 4.3 Dynamic Configuration Reload
+**Hot Reload**: Watch `config.toml` for changes. Update `min_hops`, `max_hops`, `profit_threshold` without restart.
+
+---
+
+## Implementation Checklist (Present vs. Required)
+
+| Component | Status | Action |
+|-----------|--------|--------|
+| **Pool Discovery** | ✅ Present | Keep `initialize_pools_from_markets()` |
+| **State Refresh** | ✅ Present | Keep `PoolDataRefresher` |
+| **Account Derivation** | ✅ Present | Keep `MintPoolData` structure |
+| **Graph Engine** | ❌ Missing | Implement `src/engine/graph.rs` with `dashmap` |
+| **Cycle Detection** | ❌ Missing | Implement `src/engine/detect.rs` with Tarjan's |
+| **Amount Optimization** | ❌ Missing | Implement `src/engine/optimize.rs` binary search |
+| **SDK Integration** | ❌ Missing | Add `sol-trade-sdk` dependency |
+| **Simulation Layer** | ❌ Missing | Wrap SDK's `simulate` in `src/engine/simulate.rs` |
+| **Instruction Builder** | ❌ Missing | Build `src/execution/builder.rs` to map legs to SDK params |
+| **Jito Bundles** | ❌ Missing | Integrate SDK's bundle middleware in `src/execution/bundle.rs` |
+| **Flash Loans** | ❌ Missing | Add `src/execution/flashloan.rs` with toggle |
+
+---
+
+## Configuration Schema
+
+```toml
+[arbitrage.engine]
+min_hops = 2
+max_hops = 5
+min_profit_basis_points = 50
+capital_per_cycle_percent = 20
+
+[arbitrage.simulation]
+slippage_buffer_bp = 20
+enabled = true
+
+[arbitrage.execution]
+mode = "bundled"  # "sequential", "bundled", "executor"
+jito_tip_dynamic = true
+jito_tip_min_lamports = 10000000
+jito_tip_max_lamports = 50000000
+bundle_timeout_ms = 300
+
+[arbitrage.flashloan]
+enabled = false
+min_trade_size_usd = 6000
+provider = "kamino"
+
+[monitoring]
+log_format = "json"
+metrics_enabled = true
+daily_stop_loss_usd = 100
+circuit_breaker_failures = 5
+circuit_breaker_window_minutes = 10
+```
+
+---
+Proceed sequentially. Do not advance until current phase gates are met.

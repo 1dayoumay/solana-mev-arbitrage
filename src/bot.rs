@@ -1,19 +1,15 @@
 use crate::ata::ensure_base_atas_exist;
 use crate::config::Config;
-use crate::pool_refreshers::PoolDataRefresher;
+use crate::constants::sol_mint;
+use crate::engine::*;
 use crate::refresh::initialize_pools_from_markets;
-use crate::transaction::build_and_send_transaction;
+use tokio::time::interval; 
 use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::address_lookup_table::state::AddressLookupTable;
-use solana_sdk::address_lookup_table::AddressLookupTableAccount;
-use solana_sdk::hash::Hash;
-use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -22,191 +18,64 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     info!("Configuration loaded successfully");
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
-
-    let sending_rpc_clients = if let Some(spam_config) = &config.spam {
-        if spam_config.enabled {
-            spam_config
-                .sending_rpc_urls
-                .iter()
-                .map(|url| Arc::new(RpcClient::new(url.clone())))
-                .collect::<Vec<_>>()
-        } else {
-            vec![rpc_client.clone()]
-        }
-    } else {
-        vec![rpc_client.clone()]
-    };
-
-    let wallet_kp =
-        load_keypair(&config.wallet.private_key).context("Failed to load wallet keypair")?;
+    let wallet_kp = load_keypair(&config.wallet.private_key)?;
     info!("Wallet loaded: {}", wallet_kp.pubkey());
 
-    let initial_blockhash = rpc_client.get_latest_blockhash()?;
-    let cached_blockhash = Arc::new(Mutex::new(initial_blockhash));
+    // Initialize engine components
+    let price_graph = Arc::new(PriceGraph::new());
+    let amount_optimizer = AmountOptimizer::new(price_graph.clone());  // <-- FIXED: Use ::new()
 
-    let refresh_interval = Duration::from_secs(10);
-    let blockhash_client = rpc_client.clone();
-    let blockhash_cache = cached_blockhash.clone();
-    tokio::spawn(async move {
-        blockhash_refresher(blockhash_client, blockhash_cache, refresh_interval).await;
-    });
-
-    // Initialize pools from markets config (auto-detect DEX types and group by mint)
-    let mint_pool_data_map = initialize_pools_from_markets(
+    // Initialize pools
+    let mint_pool_data = initialize_pools_from_markets(
         &config.routing.markets,
         &wallet_kp.pubkey(),
         rpc_client.clone(),
-    )
-    .await?;
+    ).await?;
 
-    info!("Initialized {} mints from markets config", mint_pool_data_map.len());
+    info!("Initialized {} mints from markets config", mint_pool_data.len());
 
-    // Ensure base token ATAs (WSOL, USDC, USD1) exist
-    // Route token ATAs are NOT created here - the on-chain program creates them as needed
-    ensure_base_atas_exist(&rpc_client, &wallet_kp)?;
+    // Build initial graph
+    for (_, pool_data) in mint_pool_data.iter() {
+        price_graph.update_from_mint_pool_data(pool_data, &rpc_client);
+    }
 
-    // Load lookup tables (global config)
-    let mut lookup_table_addresses = config.routing.markets.lookup_table_accounts.clone().unwrap_or_default();
-    lookup_table_addresses.push("4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC".to_string());
+    // Spawn detection task
+    let graph_clone = price_graph.clone();
+    tokio::spawn(async move {
+        let mut detect_interval = interval(Duration::from_millis(500));
+        loop {
+            detect_interval.tick().await;
+            
+            // <-- FIXED: Call as associated function
+            let cycles = CycleDetector::find_negative_cycles(
+                &graph_clone,
+                sol_mint(),  // <-- Now works because we imported it
+                2,
+                5,
+                50,
+            );
 
-    let mut lookup_table_accounts_list = vec![];
-    for lookup_table_account in &lookup_table_addresses {
-        match Pubkey::from_str(lookup_table_account) {
-            Ok(pubkey) => {
-                match rpc_client.get_account(&pubkey) {
-                    Ok(account) => {
-                        match AddressLookupTable::deserialize(&account.data) {
-                            Ok(lookup_table) => {
-                                let lookup_table_account = AddressLookupTableAccount {
-                                    key: pubkey,
-                                    addresses: lookup_table.addresses.into_owned(),
-                                };
-                                lookup_table_accounts_list.push(lookup_table_account);
-                                info!("   Successfully loaded lookup table: {}", pubkey);
-                            }
-                            Err(e) => {
-                                error!("   Failed to deserialize lookup table {}: {}", pubkey, e);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("   Failed to fetch lookup table account {}: {}", pubkey, e);
-                        continue;
-                    }
+            for mut cycle in cycles {
+                if let Some(amount) = amount_optimizer.optimize_amount(
+                    &mut cycle,
+                    2_000_000_000,
+                    20,
+                    500_000,
+                ) {
+                    info!("Detected profitable cycle: {} hops, {} bps profit, {} SOL", 
+                        cycle.total_hops, 
+                        cycle.total_profit_bps,
+                        cycle.estimated_profit_lamports as f64 / 1e9
+                    );
                 }
-            }
-            Err(e) => {
-                error!("   Invalid lookup table pubkey string {}: {}", lookup_table_account, e);
-                continue;
             }
         }
-    }
+    });
 
-    if lookup_table_accounts_list.is_empty() {
-        warn!("   Warning: No valid lookup tables were loaded");
-    } else {
-        info!("   Loaded {} lookup tables successfully", lookup_table_accounts_list.len());
-    }
-
-    let lookup_table_accounts_list = Arc::new(lookup_table_accounts_list);
-    let process_delay = Duration::from_millis(config.routing.markets.process_delay);
-    let pool_refresh_interval = Duration::from_secs(5);
-
-    // Spawn processing task for each mint
-    for (mint, pool_data) in mint_pool_data_map {
-        info!("Starting processing for mint: {}", mint);
-
-        let mint_pool_data = Arc::new(Mutex::new(pool_data));
-        let config_clone = config.clone();
-        let sending_rpc_clients_clone = sending_rpc_clients.clone();
-        let cached_blockhash_clone = cached_blockhash.clone();
-        let wallet_bytes = wallet_kp.to_bytes();
-        let wallet_kp_clone = Keypair::from_bytes(&wallet_bytes).unwrap();
-        let lookup_tables = lookup_table_accounts_list.clone();
-        let mint_str = mint.to_string();
-        let rpc_client_clone = rpc_client.clone();
-
-        tokio::spawn(async move {
-            // Pool refresher for CLMM pools (DLMM, Whirlpool, Raydium CLMM, PancakeSwap, Byreal)
-            let pool_refresher = PoolDataRefresher::new();
-            let mut last_pool_refresh = Instant::now()
-                .checked_sub(pool_refresh_interval)
-                .unwrap_or_else(Instant::now);
-
-            loop {
-                // Check if pool refresh is needed (every 5 seconds)
-                let now = Instant::now();
-                if now.duration_since(last_pool_refresh) >= pool_refresh_interval {
-                    let mut guard = mint_pool_data.lock().await;
-                    match pool_refresher.refresh_all_pools(&mut guard, &rpc_client_clone, false) {
-                        Ok(_) => {
-                            last_pool_refresh = now;
-                            info!("Pool data refreshed for mint {}", mint_str);
-                        }
-                        Err(e) => {
-                            error!("Failed to refresh pool data for mint {}: {}", mint_str, e);
-                        }
-                    }
-                    drop(guard);
-                }
-
-                let latest_blockhash = {
-                    let guard = cached_blockhash_clone.lock().await;
-                    *guard
-                };
-
-                let guard = mint_pool_data.lock().await;
-
-                match build_and_send_transaction(
-                    &wallet_kp_clone,
-                    &config_clone,
-                    &*guard,
-                    &sending_rpc_clients_clone,
-                    latest_blockhash,
-                    &lookup_tables,
-                )
-                .await
-                {
-                    Ok(signatures) => {
-                        info!("Transactions sent successfully for mint {}", mint_str);
-                        for signature in signatures {
-                            info!("  Signature: {}", signature);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error sending transaction for mint {}: {}", mint_str, e);
-                    }
-                }
-
-                drop(guard);
-                tokio::time::sleep(process_delay).await;
-            }
-        });
-    }
-
+    // Keep main thread alive
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-async fn blockhash_refresher(
-    rpc_client: Arc<RpcClient>,
-    cached_blockhash: Arc<Mutex<Hash>>,
-    refresh_interval: Duration,
-) {
-    loop {
-        match rpc_client.get_latest_blockhash() {
-            Ok(blockhash) => {
-                let mut guard = cached_blockhash.lock().await;
-                *guard = blockhash;
-                info!("Blockhash refreshed: {}", blockhash);
-            }
-            Err(e) => {
-                error!("Failed to refresh blockhash: {:?}", e);
-            }
-        }
-        tokio::time::sleep(refresh_interval).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        info!("Bot heartbeat: {} active mints", mint_pool_data.len());
     }
 }
 
