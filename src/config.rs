@@ -9,6 +9,7 @@ pub struct Config {
     pub spam: Option<SpamConfig>,
     pub wallet: WalletConfig,
     pub flashloan: Option<FlashloanConfig>,
+    pub discovery: Option<DiscoveryConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -53,6 +54,22 @@ pub struct FlashloanConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiscoveryConfig {
+    pub enabled: bool,
+    pub interval_minutes: u64,
+    #[serde(default = "default_min_liquidity")]
+    pub min_liquidity_usd: f64,
+    #[serde(default = "default_min_volume")]
+    pub min_volume_h24: f64,
+    #[serde(default = "default_output_file")]
+    pub output_file: String,
+}
+
+fn default_min_liquidity() -> f64 { 5000.0 }
+fn default_min_volume() -> f64 { 1000.0 }
+fn default_output_file() -> String { "discovered_pools.json".to_string() }
+
 pub fn serde_string_or_env<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -71,7 +88,6 @@ impl Config {
         let mut file = File::open(path)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
-
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
     }

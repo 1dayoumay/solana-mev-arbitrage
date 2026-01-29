@@ -11,12 +11,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
 
-    info!("Starting Solana Onchain Bot");
+    info!("Starting Solana Arbitrage Bot");
 
-    let matches = App::new("Solana Onchain Arbitrage Bot")
+    let matches = App::new("Solana Arbitrage Bot")
         .version("0.1.0")
-        .author("Cetipo")
-        .about("A simplified Solana onchain arbitrage bot")
+        .author("1dayoumay")
+        .about("Solana arbitrage bot with automated pool discovery")
         .arg(
             Arg::with_name("config")
                 .short('c')

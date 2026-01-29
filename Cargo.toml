@@ -12,44 +12,35 @@ path = "src/lib.rs"
 
 [dependencies]
 dashmap = "5.5"
-rayon = "1.8"
-ordered-float = "4.2"  # For f64 in DashMap
+futures = "0.3"
+reqwest = { version = "0.11", features = ["json"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full", "fs"] }
 
-# Core Solana dependencies
+# Core Solana dependencies (keep all - essential)
 solana-sdk = "1.17"
 solana-client = "1.17"
 solana-program = "1.17"
-solana-account-decoder = "1.17"
-solana-transaction-status = "1.17"
 
 # SPL token support
 spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "1.0.5", features = [
-    "no-entrypoint",
-] }
+spl-associated-token-account = { version = "1.0.5", features = ["no-entrypoint"] }
 
-# Serialization/deserialization
+# Serialization only for config
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.5"
 
-# Async runtime
-tokio = { version = "1.32", features = ["full"] }
-futures = "0.3"
-
 # Utilities
 anyhow = "1.0"
-thiserror = "1.0"
 rand = "0.8"
 bs58 = "0.4"
 borsh = "0.10.3"
-bytemuck = { version = "1.16.1", features = ["derive"] }
 
-# Command line argument parsing
+# CLI and logging
 clap = "3.2"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Meteora CPI (keep if using Meteora DEX)
 meteora-damm-cpi = { path = "lib/meteora-damm", features = ["no-entrypoint"] }
 meteora-vault-cpi = { path = "lib/meteora-vault", features = ["no-entrypoint"] }
